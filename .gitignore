@@ -17,3 +17,10 @@ assets/
 original/
 sparse/
 version/
+
+database.db
+*.db
+
+README.md
+LICENSE.md
+environment.yml
