@@ -1,0 +1,6 @@
+Obtaining file:///data/jikeho/repos/jsh/vanila/gaussian-splatting/submodules/diff-gaussian-rasterization
+  Preparing metadata (setup.py): started
+  Preparing metadata (setup.py): finished with status 'done'
+Installing collected packages: diff_gaussian_rasterization
+  Running setup.py develop for diff_gaussian_rasterization
+Successfully installed diff_gaussian_rasterization-0.0.0
