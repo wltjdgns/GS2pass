@@ -53,9 +53,11 @@ def render_2pass(
             pipeline,
             background,
             render_func=render_func,
-            normal_threshold=0.98,
-            min_pixel_count=1000
+            edge_threshold=0.1,   # 필요하면 조절
+            min_pixel_count=500,
         )
+
+
         
         cache['indices'] = planar_indices
         cache['normal'] = plane_normal

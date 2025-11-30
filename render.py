@@ -60,8 +60,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
     makedirs(normal_path, exist_ok=True)
-    makedirs(albedo_path, exist_ok=True)
-    makedirs(roughness_path, exist_ok=True)
+    # makedirs(albedo_path, exist_ok=True)
+    # makedirs(roughness_path, exist_ok=True)
     makedirs(pseudo_path, exist_ok=True)
 
     # === 추가: Planar visualization path ===
@@ -101,8 +101,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # Depth, Normal, Albedo, Roughness 추출
         depth_rendered = render_pkg.get("depth", None)
         normal_rendered = render_pkg.get("normal", None)
-        albedo_rendered = render_pkg.get("albedomap", None)
-        roughness_rendered = render_pkg.get("roughnessmap", None)
 
         gt = view.original_image[0:3, :, :]
         
@@ -160,9 +158,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
             # === Pseudo Normal 계산 및 저장 ===
             depth_for_pseudo = depth_norm.unsqueeze(-1)  # (H, W, 1)
-            pseudo_normal = compute_pseudo_normal(depth_for_pseudo, scale_factor = 20.0)  # (H, W, 3)
+            pseudo_normal = compute_pseudo_normal(depth_for_pseudo, scale_factor = 15.0)  # (H, W, 3)
 
             # 시각화: [-1,1] -> [0,1]
+
             pseudo_normal_visual = (pseudo_normal + 1.0) / 2.0
             pseudo_normal_visual = torch.clamp(pseudo_normal_visual, 0, 1)
             pseudo_normal_visual = pseudo_normal_visual.permute(2, 0, 1)  # (3, H, W)
@@ -179,6 +178,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             normal_visual = torch.clamp(normal_visual, 0, 1)
             torchvision.utils.save_image(normal_visual, 
                 os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"))
+            
+        
+        # albedo_rendered = render_pkg.get("albedomap", None)
+        # roughness_rendered = render_pkg.get("roughnessmap", None)
 
         
         # # Albedo 저장

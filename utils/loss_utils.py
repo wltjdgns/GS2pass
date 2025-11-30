@@ -90,71 +90,70 @@ def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
 
-
-def compute_pseudo_normal(depthmap, scale_factor=20.0):
+def compute_pseudo_normal(depthmap, scale_factor=15.0):
     """
-    Compute pseudo normal using Sobel gradient (2DGS standard)
+    Compute pseudo normal from depth using central difference
     
     Args:
-        depthmap: (H, W, 1) - normalized depth map
-        scale_factor: gradient amplification (default 5.0)
+        depthmap: (H, W, 1) - depth map in view/camera space
+        scale_factor: gradient scale (default 20.0)
     
     Returns:
-        pseudo_normal: (H, W, 3) - normalized normal map
+        pseudo_normal: (H, W, 3) - normalized normal map in view space
     """
-    depth_2d = depthmap.squeeze(-1).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    H, W = depthmap.shape[:2]
+    depth_2d = depthmap.squeeze(-1)  # (H, W)
     
-    # Sobel kernels
-    sobel_x = torch.tensor([[-1, 0, 1],
-                            [-2, 0, 2],
-                            [-1, 0, 1]], 
-                           dtype=torch.float32, device=depth_2d.device).view(1, 1, 3, 3)
+    # Pad depth map to handle boundaries
+    depth_padded = F.pad(depth_2d.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='replicate')
+    depth_padded = depth_padded.squeeze(0).squeeze(0)  # (H+2, W+2)
     
-    sobel_y = torch.tensor([[-1, -2, -1],
-                            [ 0,  0,  0],
-                            [ 1,  2,  1]], 
-                           dtype=torch.float32, device=depth_2d.device).view(1, 1, 3, 3)
+    # Central difference for gradients
+    # dz/dx: (right - left) / 2
+    dz_dx = (depth_padded[1:-1, 2:] - depth_padded[1:-1, :-2]) / 2.0  # (H, W)
+    # dz/dy: (bottom - top) / 2
+    dz_dy = (depth_padded[2:, 1:-1] - depth_padded[:-2, 1:-1]) / 2.0  # (H, W)
     
-    # Apply Sobel filters
-    dx = F.conv2d(depth_2d, sobel_x, padding=1).squeeze()  # (H, W)
-    dy = F.conv2d(depth_2d, sobel_y, padding=1).squeeze()
+    # Apply scale factor
+    dz_dx = dz_dx * scale_factor
+    dz_dy = dz_dy * scale_factor
     
-    # Normalize by Sobel kernel sum (8) and apply scale
-    dx = (dx / 8.0) * scale_factor
-    dy = (dy / 8.0) * scale_factor
+    # Construct normal: cross product of tangent vectors
+    # Tangent X: (1, 0, dz/dx)
+    # Tangent Y: (0, 1, dz/dy)
+    # Normal = Tangent_X × Tangent_Y = (-dz/dx, -dz/dy, 1)
     
-    # Construct pseudo normal: n = normalize(-dx, -dy, 1)
-    normal_x = -dx
-    normal_y = -dy
-    normal_z = torch.ones_like(dx)
+    normal_x = -dz_dx
+    normal_y = -dz_dy
+    normal_z = -torch.ones_like(dz_dx)
     
-    pseudo_normal = torch.stack([normal_x, normal_y, normal_z], dim=-1)
-    pseudo_normal = F.normalize(pseudo_normal, dim=-1)
+    # Stack and normalize
+    pseudo_normal = torch.stack([normal_x, normal_y, normal_z], dim=-1)  # (H, W, 3)
+    pseudo_normal = F.normalize(pseudo_normal, p=2, dim=-1)
     
     return pseudo_normal
 
-
-def normal_loss(rendered_normal, pseudo_normal, mask=None):
+def normal_loss(rendered_normal, pseudo_normal, reduction='mean'):
     """
-    Relightable3DGaussian Eq.4: Normal consistency loss
-    Compare rendered normal with pseudo normal from depth gradient
+    Normal consistency loss (개선된 버전)
+    
     Args:
-        rendered_normal: (H, W, 3) rendered normal map
+        rendered_normal: (H, W, 3) rendered normal
         pseudo_normal: (H, W, 3) pseudo normal from depth
-        mask: (H, W) optional mask for valid regions
+        reduction: 'mean' or 'sum'
+    
     Returns:
         loss: scalar
     """
-    # Cosine similarity: 1 - cos(a,b) = 1 - (a·b / |a||b|)
-    # Since both are normalized: loss = 1 - dot product
+    # ✅ 1. Cosine similarity loss (기존)
+    cos_sim = torch.sum(rendered_normal * pseudo_normal, dim=-1)  # (H, W)
+    loss_cos = 1.0 - cos_sim.mean()  # [0, 2]
     
-    dot_product = torch.sum(rendered_normal * pseudo_normal, dim=-1)  # (H, W)
+    # ✅ 2. L1 loss 추가 (gradient 강화)
+    loss_l1 = torch.abs(rendered_normal - pseudo_normal).mean()
     
-    if mask is not None:
-        dot_product = dot_product * mask
-        loss = (1.0 - dot_product).sum() / (mask.sum() + 1e-6)
-    else:
-        loss = (1.0 - dot_product).mean()
+    # ✅ 3. Combined loss
+    loss = loss_cos + 0.5 * loss_l1  # Weighted sum
     
     return loss
 

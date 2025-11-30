@@ -162,17 +162,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     means_view = (viewmatrix @ means3D_hom.T).T  # (N,4)
     depths_in = means_view[:, 2:3]
 
-    if pc.normal.numel() > 0:
-        # world space normal
-        normals_world = pc.normal.to(device="cuda", dtype=torch.float32)  # (N,3)
-        # 카메라 view rotation 행렬 (3x3)
-        R = viewpoint_camera.world_view_transform[:3, :3]
-        # view space 변환
-        normals_view = (R @ normals_world.T).T
-        normals_in = normals_view
-    else:
-        normals_in = torch.empty((0, 3), device="cuda", dtype=torch.float32)
+    # ===== ✅ ReCap: Shortest-axis normal =====
+    from utils.graphics_utils import prepare_normal
 
+    # World space normal (shortest axis)
+    normals_world = pc.get_normal(viewpoint_camera.camera_center)  # (N, 3)
+
+    # Camera view space 변환
+    normals_view = prepare_normal(normals_world, viewpoint_camera)  # (N, 3)
+    normals_in = normals_view
 
     # === 수정: Basecolor/Roughness ===
     if hasattr(pc, 'get_basecolor') and pc.get_basecolor.numel() > 0:
@@ -240,3 +238,128 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     }
     
     return out
+
+
+def render_depth_normal(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor):
+    """
+    Render depth and normal for loss computation.
+    
+    Returns:
+        depth_image: (1, H, W)
+        normal_image: (3, H, W) 
+        normal_ref: (3, H, W) from depth
+        alpha: (1, H, W)
+    """
+    from utils.graphics_utils import prepare_normal, depth2point_world, depthpcd2normal
+    
+    # Gradient tracking
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, 
+                                         requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+    
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    
+    # Rasterizer setup
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False,
+        antialiasing=False,
+        homo_grid=False,
+        Hmat=torch.eye(3, device="cuda", dtype=torch.float32)
+    )
+    
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
+    opacity = pc.get_opacity
+    
+    # 1. Depth rendering
+    means3D_hom = torch.cat([means3D, torch.ones((means3D.shape[0], 1), device="cuda")], dim=1)
+    means_view = (viewpoint_camera.world_view_transform @ means3D_hom.T).T
+    depths_in = means_view[:, 2:3]  # (N, 1)
+    
+    # Depth로 사용할 더미 색상
+    _, _, depth_image, _, _, _, _ = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=None,
+        colors_precomp=depths_in.repeat(1, 3),
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+        depths=depths_in,
+        normals=torch.empty((0, 3), device="cuda"),
+        basecolors=torch.empty((0, 3), device="cuda"),
+        roughness=torch.empty((0, 1), device="cuda")
+    )
+    
+    # 2. Normal rendering (shortest axis)
+    normals_world = pc.get_normal(viewpoint_camera.camera_center)  # (N, 3)
+    normals_view = prepare_normal(normals_world, viewpoint_camera)  # (N, 3)
+    
+    _, _, _, normal_image, _, _, _ = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=None,
+        colors_precomp=normals_view,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+        depths=depths_in,
+        normals=normals_view,
+        basecolors=torch.empty((0, 3), device="cuda"),
+        roughness=torch.empty((0, 1), device="cuda")
+    )
+    
+    # 3. Alpha mask
+    _, _, _, _, _, _, alpha = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=None,
+        colors_precomp=torch.ones_like(means3D),
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+        depths=depths_in,
+        normals=torch.empty((0, 3), device="cuda"),
+        basecolors=torch.empty((0, 3), device="cuda"),
+        roughness=torch.empty((0, 1), device="cuda")
+    )
+    
+    # 4. Depth-derived normal
+    intrinsic_matrix, extrinsic_matrix = viewpoint_camera.get_calib_matrix_nerf()
+    
+    # depth_image에서 실제 depth만 추출 (첫 채널)
+    depth_map = depth_image[0, :, :]
+    
+    # 현재 레포의 함수 사용
+    xyz_world = depth2point_world(depth_map, intrinsic_matrix, extrinsic_matrix)
+    normal_ref = depthpcd2normal(xyz_world)  # (H, W, 3)
+    normal_ref = normal_ref.permute(2, 0, 1)  # (3, H, W)
+    
+    # Background 처리
+    background = bg_color[:, None, None]
+    normal_ref = normal_ref * alpha + background * (1.0 - alpha)
+    
+    return depth_image, normal_image, normal_ref, alpha
