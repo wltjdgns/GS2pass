@@ -9,7 +9,7 @@ import numpy as np
 #  수정 1: Import 추가
 from utils.loss_utils import (
     l1_loss, ssim, 
-    compute_pseudo_normal, normal_loss, depth_uncertainty_loss,
+    compute_pseudo_normal, normal_loss, depth_uncertainty_loss,depth2normal_2dgs,predicted_normal_loss,
     smoothness_loss_with_edge_aware, smoothness_loss_normal  # 추가
 )
 from gaussian_renderer import render, render_2pass, EnvLight
@@ -271,49 +271,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
 
         if iteration <= opt.stage1_iter:
-            # ===== ✅ ReCap: Shortest-axis normal 기반 loss =====
-            depth_rendered = render_pkg.get("depth", None)
-            
+            depth_rendered = render_pkg.get("depth", None)  # (1, H, W) 텐서
+
             if depth_rendered is not None:
-                # 1. Depth-derived reference normal 계산
-                depth_for_pseudo = depth_rendered.permute(1, 2, 0)  # (H, W, 1)
-                pseudo_normal = compute_pseudo_normal(depth_for_pseudo, scale_factor=15.0)  # (H, W, 3)
-                pseudo_normal = F.normalize(pseudo_normal, dim=-1)
-                
-                # 2. Shortest-axis normal 렌더링 (현재 render()가 이미 shortest axis 사용 중이라면 그대로 사용)
-                #    만약 render_pkg["normal"]이 학습된 파라미터면 아래처럼 수정 필요
-                
-                # ===== Option A: render_pkg가 shortest axis normal을 반환한다면 =====
-                normal_rendered = render_pkg.get("normal", None)  # (3, H, W)
-                
+                # 1) ReCap 방식으로 world-space normal 계산
+                normal_world = depth2normal_2dgs(viewpoint_cam, depth_rendered)  # (H, W, 3)
+
+                # 2) world -> view space 변환
+                normal_view = normal_world @ viewpoint_cam.world_view_transform[:3, :3]
+
+                # 3) (H, W, 3) → (3, H, W) 변환
+                pseudo_normal = normal_view.permute(2, 0, 1).contiguous()
+
+                # 4) 렌더된 normal 가져오기 (3, H, W)
+                normal_rendered = render_pkg.get("normal", None)
+
                 if normal_rendered is not None:
-                    # view space 변환 확인 (renderer에서 이미 처리했다면 생략)
-                    normal_for_loss = F.normalize(normal_rendered.permute(1, 2, 0), dim=-1)  # (H, W, 3)
-                    
-                    # Normal consistency loss
-                    l_normal = normal_loss(normal_for_loss, pseudo_normal)
+                    normal_for_loss = F.normalize(normal_rendered, dim=0)
+
+                    # 필요시 방향 반전 (기존 경험상)
+                    normal_for_loss = -normal_for_loss
+
+                    # 5) loss 계산
+                    l_normal = predicted_normal_loss(normal_for_loss, pseudo_normal,
+                                                    alpha=viewpoint_cam.alpha_mask if hasattr(viewpoint_cam, 'alpha_mask') else None)
+
                     loss += opt.lambda_normal * l_normal
                     loss_dict['L_n'] = l_normal.item()
 
-                    if iteration == 100:
-                        # Normal 방향 통계
-                        normal_for_loss = F.normalize(normal_rendered.permute(1, 2, 0), dim=-1)
-                        
-                        print(f"\n[DEBUG iter {iteration}]")
-                        print(f"  Rendered normal stats:")
-                        print(f"    X: mean={normal_for_loss[..., 0].mean():.3f}, std={normal_for_loss[..., 0].std():.3f}")
-                        print(f"    Y: mean={normal_for_loss[..., 1].mean():.3f}, std={normal_for_loss[..., 1].std():.3f}")
-                        print(f"    Z: mean={normal_for_loss[..., 2].mean():.3f}, std={normal_for_loss[..., 2].std():.3f}")
-                        
-                        print(f"  Pseudo normal stats:")
-                        print(f"    X: mean={pseudo_normal[..., 0].mean():.3f}, std={pseudo_normal[..., 0].std():.3f}")
-                        print(f"    Y: mean={pseudo_normal[..., 1].mean():.3f}, std={pseudo_normal[..., 1].std():.3f}")
-                        print(f"    Z: mean={pseudo_normal[..., 2].mean():.3f}, std={pseudo_normal[..., 2].std():.3f}")
-                        
-                        # Cosine similarity
-                        cos_sim = torch.sum(normal_for_loss * pseudo_normal, dim=-1).mean()
-                        print(f"  Cosine similarity: {cos_sim:.3f}")
-                        print(f"  L_n: {(1.0 - cos_sim):.3f}\n")
+
+
+
         
         else:
             # ===== Stage 2: BRDF decomposition with smoothness =====

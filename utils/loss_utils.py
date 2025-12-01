@@ -125,7 +125,7 @@ def compute_pseudo_normal(depthmap, scale_factor=15.0):
     
     normal_x = -dz_dx
     normal_y = -dz_dy
-    normal_z = -torch.ones_like(dz_dx)
+    normal_z = torch.ones_like(dz_dx)
     
     # Stack and normalize
     pseudo_normal = torch.stack([normal_x, normal_y, normal_z], dim=-1)  # (H, W, 3)
@@ -242,3 +242,79 @@ def smoothness_loss_normal(rendered_normal, gt_image, epsilon=1e-3):
         loss += smoothness_loss_with_edge_aware(rendered_normal[c], gt_image, epsilon)
     return loss / 3.0
 
+
+import torch
+import torch.nn.functional as F
+
+def depth2normal_2dgs(camera, depth_map):
+    device = depth_map.device
+    depth = depth_map.squeeze(0)  # (H,W)
+
+    H, W = depth.shape
+    y, x = torch.meshgrid(
+        torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij'
+    )
+    y = y.float() + 0.5
+    x = x.float() + 0.5
+
+    K = camera.projection_matrix[:3, :3].to(device)
+    K_inv = torch.inverse(K)
+
+    pixels_homo = torch.stack([x, y, torch.ones_like(x)], dim=-1).view(-1, 3)
+    cam_coords = (K_inv @ pixels_homo.T).T * depth.view(-1, 1)
+    cam_coords_2d = cam_coords.view(H, W, 3)
+    print("cam_coords_2d.shape:", cam_coords_2d.shape)
+
+    # dz/dx (차이: 좌우 - 양쪽 패딩 필요)
+    dzdx = cam_coords_2d[:, 2:, :] - cam_coords_2d[:, :-2, :]  # (H, W-2, 3)
+    dzdx = F.pad(dzdx, (0, 0, 1, 1), mode='replicate')          # (H, W, 3)
+
+    # dz/dy (차이: 위아래 - 양쪽 패딩 필요)
+    dzdy = cam_coords_2d[2:, :, :] - cam_coords_2d[:-2, :, :]  # (H-2, W, 3)
+    dzdy = F.pad(dzdy, (1, 1, 0, 0), mode='replicate')          # (H, W, 3)
+    print("projection_matrix.shape:", camera.projection_matrix.shape)
+    print("depth_map.shape:", depth_map.shape)
+    print("cam_coords_2d.shape (after view coords):", cam_coords_2d.shape)
+    print("dzdx.shape:", dzdx.shape if 'dzdx' in locals() else None)
+    print("dzdy.shape:", dzdy.shape if 'dzdy' in locals() else None)
+
+    # 패딩 방향이 다르면 사이즈 불일치 발생 → 위처럼 꼭 맞춰주세요.
+
+    normal = torch.cross(dzdy, dzdx, dim=-1)
+    normal = F.normalize(normal, p=2, dim=-1)
+
+    R = camera.world_view_transform[:3, :3].to(device)
+    normal_world = normal @ R.T
+    return normal_world
+
+
+
+
+
+
+def predicted_normal_loss(normal, normal_ref, alpha=None):
+    """
+    Computes the predicted normal supervision loss as in ReCap.
+    Args:
+        normal: (3, H, W) predicted normal (view space)
+        normal_ref: (3, H, W) ground-truth normal (view space)
+        alpha: (optional) mask of shape (1 or 3, H, W)
+    Returns:
+        Scalar loss
+    """
+    if alpha is not None:
+        device = alpha.device
+        weight = alpha.detach().cpu().numpy()[0]
+        import cv2
+        weight = cv2.erode((weight * 255).astype(np.uint8), None, iterations=4).astype(np.float32) / 255.0
+        weight = torch.from_numpy(weight).to(device)
+        weight = weight.unsqueeze(0).repeat(3, 1, 1)  # C x H x W
+    else:
+        weight = torch.ones_like(normal_ref)
+
+    w = weight.permute(1,2,0).reshape(-1)
+    n_gt = normal_ref.permute(1,2,0).reshape(-1,3)
+    n_pred = normal.permute(1,2,0).reshape(-1,3)
+
+    loss = (w * (1.0 - torch.sum(n_gt * n_pred, dim=-1))).mean()
+    return loss
