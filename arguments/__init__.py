@@ -99,8 +99,8 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.025
-        self.scaling_lr = 0.0003
-        self.rotation_lr = 0.0008
+        self.scaling_lr = 0.005
+        self.rotation_lr = 0.001
         self.exposure_lr_init = 0.01
         self.exposure_lr_final = 0.001
         self.exposure_lr_delay_steps = 0
@@ -117,7 +117,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_reflection = 0.3   #  유지: Reflection blending weight
         
         # ===== Stage 1 Loss Weights (0~10k) =====
-        self.lambda_normal = 0.3       #  변경: 0.005 → 0.01 (L_n: Normal consistency)
+        self.lambda_normal = 0.3        #  변경: 0.005 → 0.01 (L_n: Normal consistency)
+        self.lambda_normal_smooth = 0.01 #  추가: L_{s,n} (Normal smoothness)
         
         # ===== Stage 2 Loss Weights (10k~30k) =====
         self.lambda_albedo_smooth = 0.01    #  추가: L_{s,b} (Albedo smoothness)

@@ -1,12 +1,9 @@
-# utils/planar_utils.py
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import numpy as np
-import cv2
 
-from scipy.ndimage import label  # Connected components
-from utils.loss_utils import compute_pseudo_normal  # pseudo normal from depth
+from scipy.ndimage import label  # Connected components (optional)
 
 
 def detect_planar_from_rendered_normal(
@@ -15,198 +12,142 @@ def detect_planar_from_rendered_normal(
     pipeline,
     background,
     render_func,
-    edge_threshold=0.05,
-    min_pixel_count=500,
+    normal_threshold=0.98,
+    min_pixel_count=1000
 ):
     """
-    Depth + pseudo normal + rendered normal 기반 planar 영역 검출.
-
-    흐름:
-      1) render_func로 depth, normal 렌더링
-      2) depth로 pseudo normal 생성
-      3) pseudo normal에 Sobel edge → edge map
-      4) edge로 닫힌 영역들(connected components) 중, 픽셀 수가 min_pixel_count 이상인
-         가장 큰 영역을 planar 후보로 선택
-      5) 선택된 영역에서 rendered normal 평균 → plane_normal
-      6) plane_normal과 per-Gaussian normal의 cosine similarity로 planar_indices 필터링
-      7) planar_indices의 3D 위치 평균 → plane_center
-
+    Rendered normal map에서 planar 영역 감지 후 해당 Gaussians 추출
+    
     Args:
-        viewpoint_camera: Camera 객체
-        gaussians: GaussianModel (gaussians.normal, gaussians.get_xyz 사용)
-        pipeline: PipelineParams
-        background: (3,) torch.Tensor, background color
-        render_func: callable(viewpoint_camera, gaussians, pipeline, background) -> dict
-                     dict 안에 "depth"(1,H,W), "normal"(3,H,W) 키를 포함해야 함
-        edge_threshold: Sobel edge magnitude threshold (0~1 스케일 가정 후 0~255로 곱해 사용)
-        min_pixel_count: planar 후보 최소 픽셀 수
-
+        viewpoint_camera: Camera object
+        gaussians: GaussianModel
+        pipeline: Pipeline parameters
+        background: Background tensor
+        render_func: render() 함수 (from gaussian_renderer)
+        normal_threshold: Normal similarity threshold [0.95~0.99]
+        min_pixel_count: 최소 픽셀 개수
+    
     Returns:
-        planar_indices: torch.LongTensor, shape (K,)
-            - planar로 판정된 Gaussian들의 인덱스
-        plane_normal: torch.FloatTensor, shape (3,)
-            - 선택된 planar 영역의 dominant normal
-            - rendered normal 평균 (fallback 시 pseudo normal 평균)
-        plane_center: torch.FloatTensor, shape (3,)
-            - planar_indices에 해당하는 Gaussian 위치의 평균 (world space)
-        실패 시: (None, None, None)
+        planar_indices: Tensor - Planar Gaussians의 indices
+        plane_normal: (3,) - 평면 법선
+        plane_center: (3,) - 평면 중심
     """
-
-    # ===== Step 1: Render depth / normal =====
-    with torch.no_grad():
+    
+    # ===== Step 1: Render Normal Map =====
+    with torch.no_grad():  # Planar detection은 gradient 불필요
         render_pkg = render_func(
-            viewpoint_camera,
-            gaussians,
-            pipeline,
-            background,
+            viewpoint_camera, 
+            gaussians, 
+            pipeline, 
+            background
         )
-
-    depth_map = render_pkg.get("depth", None)   # (1,H,W) or (H,W)
-    normal_map = render_pkg.get("normal", None) # (3,H,W)
-
-    if depth_map is None:
-        print("⚠️ Depth map not available")
+    
+    normal_map = render_pkg.get('normal', None)
+    
+    if normal_map is None:
+        print("⚠️ Normal map not available")
         return None, None, None
-
-    if depth_map.dim() == 3:
-        depth_map = depth_map.squeeze(0)  # (H,W)
-    H, W = depth_map.shape
-
-    # ===== Step 2: pseudo normal from depth =====
-    # depth_for_pseudo: (H,W,1)
-    depth_for_pseudo = depth_map.unsqueeze(-1)
-    # compute_pseudo_normal: (H,W,1) -> (H,W,3), [-1,1] normalized
-    pseudo_normal = compute_pseudo_normal(depth_for_pseudo, scale_factor=20.0)
-
-    # ===== Step 3: Edge detection on pseudo normal =====
-    # pseudo normal [-1,1] → [0,255] RGB → gray
-    pseudo_normal_np = pseudo_normal.cpu().numpy()
-    pseudo_vis = (pseudo_normal_np * 0.5 + 0.5) * 255.0  # (H,W,3), 0~255
-    pseudo_vis = pseudo_vis.astype(np.uint8)
-    gray = cv2.cvtColor(pseudo_vis, cv2.COLOR_RGB2GRAY)  # (H,W), uint8
-
-    # Sobel edge
-    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    edge_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)  # float32
-
-    # threshold를 0~1로 받았다고 보고 0~255 스케일로 변환
-    thr = edge_threshold * 255.0
-    _, edge_mask = cv2.threshold(edge_mag, thr, 1.0, cv2.THRESH_BINARY)
-
-    edge_mask = edge_mask.astype(np.uint8)          # 0 or 1
-    closed_regions = cv2.bitwise_not(edge_mask)     # 엣지 바깥 영역(후보 영역)
-
-    # ===== Step 4: Connected components로 planar 후보 찾기 =====
-    num_labels, labels = cv2.connectedComponents(closed_regions)
-
-    if num_labels <= 1:
-        print("⚠️ No planar regions found (connected components)")
+    
+    # (3, H, W) -> (H, W, 3)
+    normal_map = normal_map.permute(1, 2, 0)
+    H, W = normal_map.shape[:2]
+    
+    # ===== Step 2: Find Dominant Normal Direction =====
+    # Flatten to (H*W, 3)
+    normals_flat = normal_map.reshape(-1, 3)
+    normals_norm = F.normalize(normals_flat, dim=1)
+    
+    # Valid pixels (non-zero normals)
+    valid_mask = (normals_flat.norm(dim=1) > 0.1)
+    valid_normals = normals_norm[valid_mask]
+    
+    if valid_normals.shape[0] < min_pixel_count:
+        print("⚠️ Not enough valid pixels for planar detection")
         return None, None, None
-
-    best_region = None
-    best_area = 0
-
-    for lbl in range(1, num_labels):
-        region_mask = (labels == lbl)
-        area = int(region_mask.sum())
-        if area < min_pixel_count:
-            continue
-        if area > best_area:
-            best_area = area
-            best_region = region_mask
-
-    if best_region is None:
-        print(f"⚠️ No region larger than {min_pixel_count} pixels")
+    
+    # Dominant normal (평균 방향)
+    dominant_normal = valid_normals.mean(dim=0)
+    dominant_normal = F.normalize(dominant_normal, dim=0)
+    
+    # ===== Step 3: Segment Planar Region =====
+    # Pixels with similar normal to dominant
+    similarity = torch.mv(normals_norm, dominant_normal)
+    planar_pixel_mask = (similarity > normal_threshold) & valid_mask
+    planar_pixel_mask = planar_pixel_mask.reshape(H, W)
+    
+    planar_pixel_count = planar_pixel_mask.sum().item()
+    
+    if planar_pixel_count < min_pixel_count:
+        print(f"⚠️ Planar region too small: {planar_pixel_count} pixels")
         return None, None, None
-
-    # torch mask로 변환
-    best_region_mask = torch.from_numpy(best_region).to(pseudo_normal.device)  # (H,W), bool
-
-    # ===== Step 5: plane_normal 계산 (rendered normal 평균) =====
-    if normal_map is not None:
-        # normal_map: (3,H,W) -> (H,W,3)
-        normal_hw3 = normal_map.permute(1, 2, 0)
-        region_normals = normal_hw3[best_region_mask]         # (N,3)
-    else:
-        print("⚠️ Normal map not available, fallback to pseudo normal for plane_normal")
-        region_normals = pseudo_normal[best_region_mask]      # (N,3)
-
-    if region_normals.numel() == 0:
-        print("⚠️ Empty region_normals")
-        return None, None, None
-
-    region_normals = F.normalize(region_normals, dim=-1)
-    plane_normal = F.normalize(region_normals.mean(dim=0), dim=0)  # (3,)
-
-    pointwise_normals = gaussians.get_minaxis(viewpoint_camera.camera_center)
+    
+    
+    # ===== Step 4: Back-project to Gaussians =====
+    # Approximation: Gaussians with similar pointwise normal
+    pointwise_normals = gaussians.normal  # (N, 3)
     pointwise_norm = F.normalize(pointwise_normals, dim=1)
-
-    # cosine similarity
-    gaussian_similarity = torch.mv(pointwise_norm, plane_normal)   # (N,)
-    planar_gaussian_mask = gaussian_similarity > 0.90              # threshold 완화 가능
+    
+    # Similarity to dominant normal
+    gaussian_similarity = torch.mv(pointwise_norm, dominant_normal)
+    
+    # Threshold
+    planar_gaussian_mask = (gaussian_similarity > 0.95)  # Slightly lower threshold
     planar_indices = torch.where(planar_gaussian_mask)[0]
-
-    if planar_indices.numel() < 100:
-        print(f"⚠️ Not enough planar Gaussians: {planar_indices.numel()}")
+    
+    if len(planar_indices) < 100:
+        print(f"⚠️ Not enough planar Gaussians: {len(planar_indices)}")
         return None, None, None
-
-    # ===== Step 7: plane_center (world space) =====
-    planar_positions = gaussians.get_xyz[planar_indices]  # (K,3)
-    plane_center = planar_positions.mean(dim=0)           # (3,)
-
+    
+    # ===== Step 5: Compute Plane Parameters =====
+    planar_positions = gaussians.get_xyz[planar_indices]
+    planar_normals_pointwise = pointwise_normals[planar_indices]
+    
+    plane_center = planar_positions.mean(dim=0)
+    plane_normal = F.normalize(planar_normals_pointwise.mean(dim=0), dim=0)
+    
+    
     return planar_indices, plane_normal, plane_center
-
 
 def compute_plane_equation(plane_normal, plane_center):
     """
-    평면 방정식 n^T x + d = 0 의 d 계산
-
+    평면 방정식 계산: n^T x + d = 0
+    
     Args:
-        plane_normal: (3,) 단위 법선
-        plane_center: (3,) 평면 상의 한 점
-
+        plane_normal: (3,) - 단위 법선 벡터
+        plane_center: (3,) - 평면 위의 한 점
+    
     Returns:
-        plane_offset: float (스칼라 텐서) - d 값
+        plane_offset: float - plane equation의 d
     """
+    # d = -n^T * center
     plane_offset = -torch.dot(plane_normal, plane_center)
     return plane_offset
 
 
 def compute_virtual_camera(camera, plane_normal, plane_offset):
     """
-    주어진 평면에 대해 카메라를 반사시킨 virtual camera 생성.
-
-    Args:
-        camera: Camera 객체 (scene.cameras.Camera)
-        plane_normal: (3,) 단위 법선 (world space)
-        plane_offset: float, 평면 방정식 n^T x + d = 0 의 d
-
-    Returns:
-        virtual_cam: Camera 객체
+    Mirror camera across the plane to create virtual camera
     """
     from scene.cameras import Camera
-
-    # 카메라 중심 (world space)
+    
+    # Camera center in world space
     camera_center = camera.camera_center  # (3,)
-
-    # 평면에 대한 signed distance
+    
+    # Mirror camera center across plane
     distance = torch.dot(plane_normal, camera_center) + plane_offset
-    t_virtual = camera_center - 2 * distance * plane_normal  # 반사된 위치
-
-    # 회전 반사 행렬 R_mirror
-    R_mirror = torch.eye(3, device=camera_center.device) - 2 * torch.outer(
-        plane_normal, plane_normal
-    )
-
-    # world_to_cam 회전
+    t_virtual = camera_center - 2 * distance * plane_normal
+    
+    # Mirror rotation
+    R_mirror = torch.eye(3, device="cuda") - 2 * torch.outer(plane_normal, plane_normal)
+    
+    # Camera rotation (world to camera)
     R_world_to_cam = camera.world_view_transform[:3, :3].t()
-
-    # virtual camera의 world 방향 회전
+    
+    # Virtual camera rotation
     R_virtual_to_world = R_mirror @ R_world_to_cam
-
-    # 이미지를 PIL로 변환 (Camera 생성자 입력 형식 맞추기 위함)
-    original_tensor = camera.original_image  # (3,H,W)
+    
+    # Tensor를 PIL Image로 변환
+    original_tensor = camera.original_image  # 3, H, W
     image_pil = TF.to_pil_image(original_tensor.cpu())
 
     virtual_cam = Camera(
@@ -217,7 +158,7 @@ def compute_virtual_camera(camera, plane_normal, plane_offset):
         FoVx=camera.FoVx,
         FoVy=camera.FoVy,
         depth_params=None,
-        image=image_pil,
+        image=image_pil,  #  PIL Image 전달
         invdepthmap=None,
         image_name="virtual",
         uid=-1,
@@ -226,22 +167,23 @@ def compute_virtual_camera(camera, plane_normal, plane_offset):
         data_device="cuda",
         train_test_exp=False,
         is_test_dataset=False,
-        is_test_view=False,
+        is_test_view=False
     )
     return virtual_cam
 
 
+
 def compute_virtual_camera_simple(camera, plane_normal, plane_center):
     """
-    plane_center로부터 plane_offset을 계산한 뒤 virtual camera를 생성하는 헬퍼.
-
+    간단한 버전: plane_center로부터 직접 계산
+    
     Args:
-        camera: Camera 객체
-        plane_normal: (3,) 단위 법선
-        plane_center: (3,) 평면 중심
-
+        camera: Camera object
+        plane_normal: (3,) - 정규화된 법선
+        plane_center: (3,) - 평면 중심점
+    
     Returns:
-        virtual_cam: Camera 객체
+        virtual_camera: Camera object
     """
     plane_offset = compute_plane_equation(plane_normal, plane_center)
     return compute_virtual_camera(camera, plane_normal, plane_offset)

@@ -1,13 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
 
 import torch
 import math
@@ -75,54 +65,3 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
-
-
-# ============================================================
-# ✅ ReCap Normal 관련 함수 추가 (파일 끝에)
-# ============================================================
-
-def get_model_view_matrix_for_normal(world_view_transform, homo=True):
-    """
-    Normal 변환용 ModelView 행렬 생성
-    
-    Args:
-        world_view_transform: (4, 4) world-to-view 변환 행렬
-        homo: homogeneous 좌표 사용 여부
-    Returns:
-        (4, 4) or (3, 3) 변환 행렬
-    """
-    if homo:
-        # Homogeneous 좌표계: (4, 4) 행렬의 translation 제거
-        new_world_view = torch.eye(4, device=world_view_transform.device, dtype=world_view_transform.dtype)
-        new_world_view[:3, :3] = world_view_transform[:3, :3]  # Rotation만 사용
-        return new_world_view
-    else:
-        # (3, 3) Rotation 행렬만 반환
-        return world_view_transform[:3, :3]
-
-
-def prepare_normal(normal, camera):
-    """
-    Normal을 카메라 좌표계로 변환
-    
-    Args:
-        normal: (N, 3) Gaussian normal vectors in world space
-        camera: Camera object with world_view_transform
-    Returns:
-        (N, 3) Normal vectors in camera space
-    """
-    # World-to-camera 변환 행렬 (translation 제외)
-    old_world_view = camera.world_view_transform.T  # (4, 4)
-    new_world_view = get_model_view_matrix_for_normal(old_world_view, homo=True).cuda()
-    
-    # Homogeneous 좌표로 변환: (N, 3) → (N, 4)
-    hom_normal = torch.cat([normal, torch.ones(normal.shape[0], 1).cuda()], dim=-1)  # (N, 4)
-    
-    # 변환 적용
-    normal_transformed = torch.matmul(hom_normal, new_world_view.T)  # (N, 4)
-    normal = normal_transformed[:, :3]  # (N, 3)
-    
-    # Normalize
-    normal = torch.nn.functional.normalize(normal, p=2, dim=1)
-    
-    return normal

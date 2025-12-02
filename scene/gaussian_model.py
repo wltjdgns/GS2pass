@@ -49,6 +49,7 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.normal = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
@@ -149,48 +150,6 @@ class GaussianModel:
         else:
             return self.pretrained_exposures[image_name]
     
-    def get_minaxis(self, cam_center):
-        """
-        ReCap: Shortest axis를 normal로 사용
-        
-        Args:
-            cam_center: (3,) or (1, 3) 카메라 중심 좌표
-        Returns:
-            (N, 3) normal vectors
-        """
-        pts = self.get_xyz  # (N, 3)
-        p2o = cam_center[None] - pts  # (1, 3) - (N, 3) = (N, 3)
-        
-        scales = self.get_scaling  # (N, 3)
-        
-        # 가장 작은 스케일의 축 찾기
-        min_axis_id = torch.argmin(scales, dim=-1, keepdim=True)  # (N, 1)
-        min_axis = torch.zeros_like(scales).scatter(1, min_axis_id, 1)  # (N, 3) one-hot
-        
-        # 회전 행렬 적용
-        rot_matrix = build_rotation(self.get_rotation)  # (N, 3, 3)
-        ndir = torch.bmm(rot_matrix, min_axis.unsqueeze(-1)).squeeze(-1)  # (N, 3)
-        
-        # 카메라를 향하도록 방향 보정
-        neg_mask = torch.sum(p2o * ndir, dim=-1) < 0  # (N,)
-        ndir[neg_mask] = -ndir[neg_mask]
-        
-        return ndir
-
-
-    def get_normal(self, cam_center):
-        """
-        Normal 반환 (shortest axis 기반)
-        
-        Args:
-            cam_center: (3,) or (1, 3) 카메라 중심 좌표
-        Returns:
-            (N, 3) normalized normal vectors
-        """
-        normal = self.get_minaxis(cam_center)
-        return normal
-
-
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -226,7 +185,13 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
-        num_points = fused_point_cloud.shape[0]
+
+        # ✅ Normal 초기화 (한 번만)
+        num_points = fused_point_cloud.shape[0]  # ✅ fused_point_cloud 사용
+        normal = torch.randn((num_points, 3), device="cuda")
+        normal = torch.nn.functional.normalize(normal, dim=1)
+        self.normal = nn.Parameter(normal.requires_grad_(True))
+        
         # ✅ BRDF 파라미터 초기화
         # Basecolor: RGB 색상으로 초기화
         fused_color_rgb = torch.tensor(np.asarray(pcd.colors)).float().cuda()
@@ -253,7 +218,8 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self.normal], 'lr': training_args.normal_lr, 'name': 'normal'}
         ]
 
         if self.optimizer_type == "default":
@@ -290,7 +256,7 @@ class GaussianModel:
                 return lr
 
     def construct_list_of_attributes(self):
-        l = ['x', 'y', 'z']
+        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         # All channels except the 3 DC
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
@@ -312,6 +278,7 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
+        normals = self.normal.detach().cpu().numpy()  # ✅ 실제 학습된 normal 저장
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
@@ -326,7 +293,7 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, f_dc, f_rest, 
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, 
                                 opacities, scale, rotation,
                                 basecolor, roughness, metallic), axis=1)
         elements[:] = list(map(tuple, attributes))
@@ -381,6 +348,20 @@ class GaussianModel:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        # ===== ✅ 수정: Normal 로드 =====
+        try:
+            normals = np.stack((np.asarray(plydata.elements[0]["nx"]),
+                            np.asarray(plydata.elements[0]["ny"]),
+                            np.asarray(plydata.elements[0]["nz"])), axis=1)
+            self.normal = nn.Parameter(torch.tensor(normals, dtype=torch.float, device="cuda").requires_grad_(True))
+            print(f"✅ Loaded normals from PLY: {normals.shape}")
+        except:
+            print("⚠️ Normal not found in PLY, initializing randomly")
+            num_points = xyz.shape[0]
+            normal = torch.randn(num_points, 3, device="cuda")
+            normal = torch.nn.functional.normalize(normal, dim=1)
+            self.normal = nn.Parameter(normal.requires_grad_(True))
 
         # ===== ✅ 기존: BRDF 로딩 =====
         try:
@@ -467,6 +448,8 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
+        self.normal = optimizable_tensors["normal"]  # ⬅️ 이 한 줄만 바꾸면 됨!
+
         # ✅ 추가: BRDF prune
         self._basecolor = self._basecolor[valid_points_mask]
         self._roughness = self._roughness[valid_points_mask]
@@ -495,16 +478,19 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_normal):
         d = {"xyz": new_xyz,
             "f_dc": new_features_dc,
             "f_rest": new_features_rest,
             "opacity": new_opacities,
             "scaling" : new_scaling,
             "rotation" : new_rotation}
-        
-        optimizable_tensors = self.cat_tensors_to_optimizer(d)
 
+        # optimizer dict에 추가 (normal/depth는 optimizer param_group에 있음)
+        if new_normal is not None:
+            d["normal"] = new_normal
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -512,6 +498,10 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         
+        # normal과 depth도 optimizer에서 가져오기
+        if "normal" in optimizable_tensors:
+            self.normal = optimizable_tensors["normal"]
+
         # ✅ 추가: BRDF densification
         N_new = new_xyz.shape[0]
         new_basecolor = torch.zeros((N_new, 3), device="cuda")  # sigmoid(0) = 0.5
@@ -548,7 +538,10 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        # ===== Relightable3DGaussian: Replicate normal and depth =====
+        new_normal = self.normal[selected_pts_mask].repeat(N, 1)  # (N*num_selected, 3)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_normal)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -568,7 +561,10 @@ class GaussianModel:
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        # ===== Relightable3DGaussian: Clone normal and depth =====
+        new_normal = self.normal[selected_pts_mask]  # (num_selected, 3)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_normal)
 
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):

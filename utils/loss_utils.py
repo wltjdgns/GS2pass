@@ -1,13 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
 
 import torch
 import torch.nn.functional as F
@@ -90,70 +80,71 @@ def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
 
-def compute_pseudo_normal(depthmap, scale_factor=15.0):
+
+def compute_pseudo_normal(depthmap, scale_factor=20.0):
     """
-    Compute pseudo normal from depth using central difference
+    Compute pseudo normal using Sobel gradient (2DGS standard)
     
     Args:
-        depthmap: (H, W, 1) - depth map in view/camera space
-        scale_factor: gradient scale (default 20.0)
+        depthmap: (H, W, 1) - normalized depth map
+        scale_factor: gradient amplification (default 5.0)
     
     Returns:
-        pseudo_normal: (H, W, 3) - normalized normal map in view space
+        pseudo_normal: (H, W, 3) - normalized normal map
     """
-    H, W = depthmap.shape[:2]
-    depth_2d = depthmap.squeeze(-1)  # (H, W)
+    depth_2d = depthmap.squeeze(-1).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
     
-    # Pad depth map to handle boundaries
-    depth_padded = F.pad(depth_2d.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='replicate')
-    depth_padded = depth_padded.squeeze(0).squeeze(0)  # (H+2, W+2)
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1, 0, 1],
+                            [-2, 0, 2],
+                            [-1, 0, 1]], 
+                           dtype=torch.float32, device=depth_2d.device).view(1, 1, 3, 3)
     
-    # Central difference for gradients
-    # dz/dx: (right - left) / 2
-    dz_dx = (depth_padded[1:-1, 2:] - depth_padded[1:-1, :-2]) / 2.0  # (H, W)
-    # dz/dy: (bottom - top) / 2
-    dz_dy = (depth_padded[2:, 1:-1] - depth_padded[:-2, 1:-1]) / 2.0  # (H, W)
+    sobel_y = torch.tensor([[-1, -2, -1],
+                            [ 0,  0,  0],
+                            [ 1,  2,  1]], 
+                           dtype=torch.float32, device=depth_2d.device).view(1, 1, 3, 3)
     
-    # Apply scale factor
-    dz_dx = dz_dx * scale_factor
-    dz_dy = dz_dy * scale_factor
+    # Apply Sobel filters
+    dx = F.conv2d(depth_2d, sobel_x, padding=1).squeeze()  # (H, W)
+    dy = F.conv2d(depth_2d, sobel_y, padding=1).squeeze()
     
-    # Construct normal: cross product of tangent vectors
-    # Tangent X: (1, 0, dz/dx)
-    # Tangent Y: (0, 1, dz/dy)
-    # Normal = Tangent_X × Tangent_Y = (-dz/dx, -dz/dy, 1)
+    # Normalize by Sobel kernel sum (8) and apply scale
+    dx = (dx / 8.0) * scale_factor
+    dy = (dy / 8.0) * scale_factor
     
-    normal_x = -dz_dx
-    normal_y = -dz_dy
-    normal_z = torch.ones_like(dz_dx)
+    # Construct pseudo normal: n = normalize(-dx, -dy, 1)
+    normal_x = -dx
+    normal_y = -dy
+    normal_z = torch.ones_like(dx)
     
-    # Stack and normalize
-    pseudo_normal = torch.stack([normal_x, normal_y, normal_z], dim=-1)  # (H, W, 3)
-    pseudo_normal = F.normalize(pseudo_normal, p=2, dim=-1)
+    pseudo_normal = torch.stack([normal_x, normal_y, normal_z], dim=-1)
+    pseudo_normal = F.normalize(pseudo_normal, dim=-1)
     
     return pseudo_normal
 
-def normal_loss(rendered_normal, pseudo_normal, reduction='mean'):
+
+def normal_loss(rendered_normal, pseudo_normal, mask=None):
     """
-    Normal consistency loss (개선된 버전)
-    
+    Relightable3DGaussian Eq.4: Normal consistency loss
+    Compare rendered normal with pseudo normal from depth gradient
     Args:
-        rendered_normal: (H, W, 3) rendered normal
+        rendered_normal: (H, W, 3) rendered normal map
         pseudo_normal: (H, W, 3) pseudo normal from depth
-        reduction: 'mean' or 'sum'
-    
+        mask: (H, W) optional mask for valid regions
     Returns:
         loss: scalar
     """
-    # ✅ 1. Cosine similarity loss (기존)
-    cos_sim = torch.sum(rendered_normal * pseudo_normal, dim=-1)  # (H, W)
-    loss_cos = 1.0 - cos_sim.mean()  # [0, 2]
+    # Cosine similarity: 1 - cos(a,b) = 1 - (a·b / |a||b|)
+    # Since both are normalized: loss = 1 - dot product
     
-    # ✅ 2. L1 loss 추가 (gradient 강화)
-    loss_l1 = torch.abs(rendered_normal - pseudo_normal).mean()
+    dot_product = torch.sum(rendered_normal * pseudo_normal, dim=-1)  # (H, W)
     
-    # ✅ 3. Combined loss
-    loss = loss_cos + 0.5 * loss_l1  # Weighted sum
+    if mask is not None:
+        dot_product = dot_product * mask
+        loss = (1.0 - dot_product).sum() / (mask.sum() + 1e-6)
+    else:
+        loss = (1.0 - dot_product).mean()
     
     return loss
 
@@ -241,80 +232,3 @@ def smoothness_loss_normal(rendered_normal, gt_image, epsilon=1e-3):
     for c in range(3):
         loss += smoothness_loss_with_edge_aware(rendered_normal[c], gt_image, epsilon)
     return loss / 3.0
-
-
-import torch
-import torch.nn.functional as F
-
-def depth2normal_2dgs(camera, depth_map):
-    device = depth_map.device
-    depth = depth_map.squeeze(0)  # (H,W)
-
-    H, W = depth.shape
-    y, x = torch.meshgrid(
-        torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij'
-    )
-    y = y.float() + 0.5
-    x = x.float() + 0.5
-
-    K = camera.projection_matrix[:3, :3].to(device)
-    K_inv = torch.inverse(K)
-
-    pixels_homo = torch.stack([x, y, torch.ones_like(x)], dim=-1).view(-1, 3)
-    cam_coords = (K_inv @ pixels_homo.T).T * depth.view(-1, 1)
-    cam_coords_2d = cam_coords.view(H, W, 3)
-    print("cam_coords_2d.shape:", cam_coords_2d.shape)
-
-    # dz/dx (차이: 좌우 - 양쪽 패딩 필요)
-    dzdx = cam_coords_2d[:, 2:, :] - cam_coords_2d[:, :-2, :]  # (H, W-2, 3)
-    dzdx = F.pad(dzdx, (0, 0, 1, 1), mode='replicate')          # (H, W, 3)
-
-    # dz/dy (차이: 위아래 - 양쪽 패딩 필요)
-    dzdy = cam_coords_2d[2:, :, :] - cam_coords_2d[:-2, :, :]  # (H-2, W, 3)
-    dzdy = F.pad(dzdy, (1, 1, 0, 0), mode='replicate')          # (H, W, 3)
-    print("projection_matrix.shape:", camera.projection_matrix.shape)
-    print("depth_map.shape:", depth_map.shape)
-    print("cam_coords_2d.shape (after view coords):", cam_coords_2d.shape)
-    print("dzdx.shape:", dzdx.shape if 'dzdx' in locals() else None)
-    print("dzdy.shape:", dzdy.shape if 'dzdy' in locals() else None)
-
-    # 패딩 방향이 다르면 사이즈 불일치 발생 → 위처럼 꼭 맞춰주세요.
-
-    normal = torch.cross(dzdy, dzdx, dim=-1)
-    normal = F.normalize(normal, p=2, dim=-1)
-
-    R = camera.world_view_transform[:3, :3].to(device)
-    normal_world = normal @ R.T
-    return normal_world
-
-
-
-
-
-
-def predicted_normal_loss(normal, normal_ref, alpha=None):
-    """
-    Computes the predicted normal supervision loss as in ReCap.
-    Args:
-        normal: (3, H, W) predicted normal (view space)
-        normal_ref: (3, H, W) ground-truth normal (view space)
-        alpha: (optional) mask of shape (1 or 3, H, W)
-    Returns:
-        Scalar loss
-    """
-    if alpha is not None:
-        device = alpha.device
-        weight = alpha.detach().cpu().numpy()[0]
-        import cv2
-        weight = cv2.erode((weight * 255).astype(np.uint8), None, iterations=4).astype(np.float32) / 255.0
-        weight = torch.from_numpy(weight).to(device)
-        weight = weight.unsqueeze(0).repeat(3, 1, 1)  # C x H x W
-    else:
-        weight = torch.ones_like(normal_ref)
-
-    w = weight.permute(1,2,0).reshape(-1)
-    n_gt = normal_ref.permute(1,2,0).reshape(-1,3)
-    n_pred = normal.permute(1,2,0).reshape(-1,3)
-
-    loss = (w * (1.0 - torch.sum(n_gt * n_pred, dim=-1))).mean()
-    return loss

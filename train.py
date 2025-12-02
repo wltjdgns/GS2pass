@@ -9,7 +9,7 @@ import numpy as np
 #  수정 1: Import 추가
 from utils.loss_utils import (
     l1_loss, ssim, 
-    compute_pseudo_normal, normal_loss, depth_uncertainty_loss,depth2normal_2dgs,predicted_normal_loss,
+    compute_pseudo_normal, normal_loss, depth_uncertainty_loss,
     smoothness_loss_with_edge_aware, smoothness_loss_normal  # 추가
 )
 from gaussian_renderer import render, render_2pass, EnvLight
@@ -271,36 +271,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
 
         if iteration <= opt.stage1_iter:
-            depth_rendered = render_pkg.get("depth", None)  # (1, H, W) 텐서
+            depth_rendered = render_pkg.get("depth", None)
+            normal_rendered = render_pkg.get("normal", None)
+            
+            if depth_rendered is not None and normal_rendered is not None:
+                # pseudo normal 계산 (view space 깊이 사용)
+                depth_for_pseudo = depth_rendered.permute(1, 2, 0)  # (H, W, 1)
+                pseudo_normal = compute_pseudo_normal(depth_for_pseudo, scale_factor=20.0)
+                
+                # view space로 맞추기 위해 정규화
+                normal_for_loss = F.normalize(normal_rendered.permute(1, 2, 0), dim=-1)  # (H, W, 3)
+                pseudo_normal = F.normalize(pseudo_normal, dim=-1)
+                
+                # normal consistency loss 계산
+                l_normal = normal_loss(normal_for_loss, pseudo_normal)
+                loss += opt.lambda_normal * l_normal
+                loss_dict['L_n'] = l_normal.item()
 
-            if depth_rendered is not None:
-                # 1) ReCap 방식으로 world-space normal 계산
-                normal_world = depth2normal_2dgs(viewpoint_cam, depth_rendered)  # (H, W, 3)
-
-                # 2) world -> view space 변환
-                normal_view = normal_world @ viewpoint_cam.world_view_transform[:3, :3]
-
-                # 3) (H, W, 3) → (3, H, W) 변환
-                pseudo_normal = normal_view.permute(2, 0, 1).contiguous()
-
-                # 4) 렌더된 normal 가져오기 (3, H, W)
-                normal_rendered = render_pkg.get("normal", None)
-
-                if normal_rendered is not None:
-                    normal_for_loss = F.normalize(normal_rendered, dim=0)
-
-                    # 필요시 방향 반전 (기존 경험상)
-                    normal_for_loss = -normal_for_loss
-
-                    # 5) loss 계산
-                    l_normal = predicted_normal_loss(normal_for_loss, pseudo_normal,
-                                                    alpha=viewpoint_cam.alpha_mask if hasattr(viewpoint_cam, 'alpha_mask') else None)
-
-                    loss += opt.lambda_normal * l_normal
-                    loss_dict['L_n'] = l_normal.item()
-
-
-
+                # 기존 edge-aware normal smoothness loss 유지
+                loss_smooth_n = smoothness_loss_normal(normal_rendered, gt_image)
+                loss += opt.lambda_normal_smooth * loss_smooth_n
+                loss_dict['L_s_n'] = loss_smooth_n.item()
 
         
         else:
@@ -320,19 +311,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_dict['L_s_r'] = loss_smooth_r.item()
 
         loss.backward()
-        if 100 <= iteration <= 300 and iteration % 100 == 0:
-            print(f"\n[GRAD DEBUG iter {iteration}]")
-            print("  L_n (this iter):", loss_dict['L_n'])
-
-            if gaussians._rotation.grad is not None:
-                print("  rotation grad norm:", gaussians._rotation.grad.norm().item())
-            else:
-                print("  rotation grad is None")
-
-            if gaussians._scaling.grad is not None:
-                print("  scaling grad norm :", gaussians._scaling.grad.norm().item())
-            else:
-                print("  scaling grad is None")
 
         iter_end.record()
 
@@ -359,7 +337,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress_bar.set_postfix({
                         "Stage": stage_name,
                         "Loss": f"{ema_loss_for_log:.5f}",
-                        "L_n": f"{ema_loss_dict['L_n']:.5f}"
+                        "L_n": f"{ema_loss_dict['L_n']:.5f}",
+                        "Ls_n": f"{ema_loss_dict['L_s_n']:.5f}"
                     })
                 else:
                     # Stage 2: L_s_b, L_s_r 표시
@@ -420,8 +399,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                                     f"planar_cache_{iteration}.pth")
                     torch.save(planar_cache_per_view, planar_cache_path)
                     print(f"   Saved planar cache: {len(planar_cache_per_view)} views")
-
-            
                     
 
 def prepare_output_and_logger(args):    
